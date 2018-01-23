@@ -1,0 +1,202 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 NAME
+
+  DamID_add_gene_info
+
+=head1 SYNOPSIS
+
+  DamID_add_gene_info --gff /path/to/gff-file
+
+=head1 DESCRIPTION
+
+  This script adds annotation to a GFF file produced through DamID. It makes
+use of the ensembl API to identify genes in C.elegans close to the loci present
+in the GFF file. Should the locus be within a gene, the name and description of
+this will be added to the GFF annotation field. If the locus is not within a
+gene, genes within 10kb upstream or downstream will be annotated. 
+
+The script is dependent upon the ensembl API, which is tied to specific versions
+of the ensembl database. This may therefore need to be updated prior to running
+the script -the version of the ensembl database and genome build in use are
+reported by the script. These should be compared with the versions on
+www.ensembl.org to determine if an upgrade is required. 
+
+Analysis of different organisms will require the sscript to be modified to
+change all occurrences of the species name (caenorhabditis_elegans).
+
+=head1 REQUIRED ARGUMENTS
+
+=over 4
+
+=item B<gff>: Path to input GFF file
+
+=back
+
+=cut
+
+use warnings;
+use strict;
+
+# installation of ensembl API in non-standard path will require the
+# 'use lib' statement to be updated to the location where the API is
+# installed
+# The following value is appropriate for the BDSG login server: codon.bioinformatics.ic.ac.uk
+use lib "/usr/biosoft/perl_modules/ensembl/current/ensembl/modules";
+
+use Bio::EnsEMBL::Registry;
+use Getopt::Long;
+use Term::ProgressBar;
+use Pod::Usage;
+
+{
+    my ( $help, $man, $gff );
+
+    my $result = GetOptions(
+                             'gff=s' => \$gff,
+                             'help'  => \$help,
+                             'man'   => \$man,
+                           );
+
+    die "Unknown argument: @ARGV" if "@ARGV";
+    pod2usage( verbose => 2 ) if ($man);
+    pod2usage( verbose => 1 ) if ($help);
+    die "no gff file provided..." unless ($gff);
+
+    print "Connecting to EnsEMBL...\n";
+
+    my $registry = 'Bio::EnsEMBL::Registry';
+
+    $registry->load_registry_from_db( -host => 'ensembldb.ensembl.org',
+                                      -user => 'anonymous' );
+
+    my @db_adaptors = @{ $registry->get_all_DBAdaptors() };
+
+    foreach my $db_adaptor (@db_adaptors) {
+        my $db_connection = $db_adaptor->dbc();
+
+        if ( $db_adaptor->species() eq 'caenorhabditis_elegans' ) {
+            my $genebuild = $db_connection->dbname();
+            $genebuild =~ s/caenorhabditis_elegans_core_//;
+            my ( $ensver, $rel ) = split( /_/, $genebuild );
+            print "\nUsing Ensembl release $ensver; wormbase release $rel\n";
+            print
+"If this is not the latest ensembl release (see http://www.ensembl.org/Caenorhabditis_elegans/Info/Index) , please update the Ensembl API\n";
+        }
+    }
+
+    my $slice_adaptor = $registry->get_adaptor( 'caenorhabditis_elegans', 'Core', 'Slice' );
+
+    my %chr_lengths;
+    print "\nChromosome lengths...\n";
+    foreach my $chr (qw(I II III IV V X MtDNA)) {
+        my $chr_slice = $slice_adaptor->fetch_by_region( 'chromosome', $chr );
+        $chr_lengths{$chr} = $chr_slice->end();
+        print "$chr\t" . $chr_slice->end() . "\n";
+    }
+    print "\n";
+
+    my $out = $gff;
+    $out =~ s/gff/annotated.gff/;
+    my $entries = `wc -l $gff`;
+    chomp $entries;
+    my $count = 0;
+    my $progress = Term::ProgressBar->new( { count => $entries, ETA => 'linear' } );
+
+    open GFF, $gff    or die "Could not open gff file $gff: $!\n";
+    open OUT, ">$out" or die "Could not open output file $out: $!";
+    while ( my @fields = split( /\t/, <GFF> ) ) {
+        $progress->update( ++$count );
+        my $chr   = $fields[0];
+        my $start = $fields[3];
+        my $end   = $fields[4];
+        chomp $fields[8];
+        $chr =~ s/chr//i;    # convert to ensembl standard chromosome names
+
+        if ( $fields[5] > 0 ) {
+
+            #first request the precise region and see if it is spanned by a gene...
+            my $slice = $slice_adaptor->fetch_by_region( 'chromosome', $chr, $start, $end );
+            my $genes = $slice->get_all_Genes_by_type('protein_coding');
+            if ( $genes->[0] ) {
+                $fields[8] = "" if ( $fields[8] eq "." );
+                foreach my $gene (@$genes) {
+                    if ( $gene->external_name() ) {    #exclude RNAs etc...
+                        $fields[8] .= "; " if ( $fields[8] );
+                        $fields[8] .= 'gene "' . $gene->external_name;
+                        $fields[8] .= '(' . $gene->description() . ')' if ( $gene->description );
+                        $fields[8] .= '"';
+                    }
+                }
+            }
+            else {
+                my $slice_start = $start - 10000;
+                my $slice_end   = $end + 10000;
+                $slice_start = 0 if ( $slice_start < 0 );
+                $slice_end = $chr_lengths{$chr} if ( $slice_end > $chr_lengths{$chr} );
+
+                # need to check end coords similarly
+
+                my $slice           = $slice_adaptor->fetch_by_region( 'chromosome', $chr, $slice_start, $slice_end );
+                my $projected       = $slice->project('chromosome');
+                my $projected_slice = $projected->[0]->[2];
+
+                my $genes = $projected_slice->get_all_Genes_by_type('protein_coding');
+                my ( @upstream, @downstream );
+                foreach my $gene (@$genes) {
+                    if ( $gene->end() < $start ) {
+                        push( @upstream, $gene );
+                    }
+                    elsif ( $gene->start() > $end ) {
+                        push( @downstream, $gene );
+                    }
+                    elsif (    ( $start >= $gene->start() && $end <= $gene->end() )
+                            || ( $start <= $gene->start && $end <= $gene->end() )
+                            || ( $start >= $gene->start && $end >= $gene->end() ) )
+                    {
+                        $fields[8] = "" if ( $fields[8] eq "." );
+
+      #genes spanning region...for some reason not all of these are returned by above check so need to pick them up here
+                        $fields[8] .= 'gene "' . $gene->external_name;
+                        $fields[8] .= '(' . $gene->description() . ')' if ( $gene->description );
+                        $fields[8] .= '"';
+                    }
+                    else {
+                        die "Couldn't work out what to do with gene "
+                          . $gene->start . "-"
+                          . $gene->end
+                          . "; loc=$start-$end; slice="
+                          . $projected_slice->start . "-"
+                          . $projected_slice->end . "\n";
+                    }
+                }
+                if ( $#upstream >= 0 ) {
+                    $fields[8] = "" if ( $fields[8] eq "." );
+                    my $upstream_gene = $upstream[$#upstream];    # closest to region should be last array element
+                    if ( $upstream_gene->external_name() ) {
+                        $fields[8] .= "; " if ( $fields[8] );
+                        $fields[8] .= 'upstream_of_gene "' . $upstream_gene->external_name;
+                        $fields[8] .= '(' . $upstream_gene->description() . ')' if ( $upstream_gene->description );
+                        $fields[8] .= '"';
+                    }
+                }
+                if ( $#downstream >= 0 ) {
+                    $fields[8] = "" if ( $fields[8] eq "." );
+                    my $downstream_gene = $downstream[0];         # first downstream gene from region...
+                    if ( $downstream_gene->external_name() ) {
+                        $fields[8] .= "; " if ( $fields[8] );
+                        $fields[8] .= 'downstream_of_gene "' . $downstream_gene->external_name;
+                        $fields[8] .= '(' . $downstream_gene->description() . ')' if ( $downstream_gene->description );
+                        $fields[8] .= '"';
+                    }
+                }
+            }
+
+            #warn "no gene info found for $start-$end" if ($fields[8] eq '.');
+        }
+        print OUT join( "\t", @fields ), "\n";
+    }
+    close GFF;
+}
